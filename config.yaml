@@ -1,0 +1,41 @@
+# ASCOM Alpaca FLI server configuration.
+#
+# On Linux, `library` must point at the shared libfli built by
+# sdk/build_libfli.sh, and the fliusb kernel module must be loaded
+# (/dev/fliusb*). On macOS, set demo: true on each device to run without
+# hardware.
+
+entity: fli_camera
+library: /usr/local/lib/libfli.so   # or ./sdk/libfli.so after building
+log_level: INFO
+
+server:
+  host: 0.0.0.0
+  port: 5555
+
+cameras:
+  - entity: FLI Camera
+    device_number: 0
+    # Selection (first non-empty wins): serial_number -> model -> device_index.
+    serial_number: ""      # e.g. "ML0123" — most robust selector
+    model: ""              # e.g. "MicroLine" — substring match
+    device_index: 0
+    warm_temperature: 25.0 # set-point used to emulate CoolerOn=False
+    demo: true             # <-- set false on the Linux hardware box
+    defaults:
+      temperature: -20.0   # cooler set-point (C)
+      binning: 1
+      cooler_on: false
+      nflushes: 1
+
+filterwheels:
+  - entity: FLI Filter Wheel
+    device_number: 0
+    serial_number: ""
+    model: ""
+    device_index: 0
+    # Optional overrides; if empty, names come from the wheel and offsets are 0.
+    filter_names: []       # e.g. ["Ha", "OIII", "SII", "Lum", "Dark"]
+    focus_offsets: []      # e.g. [0, 12, 8, 0, 0]
+    demo: true             # <-- set false on the Linux hardware box
+    demo_positions: 5
