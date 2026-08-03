@@ -128,15 +128,43 @@ attached (a disconnected device correctly returns `NotConnectedException`).
 ## ASCOM Conformance
 
 <!-- conformu:start -->
-Last tested with **ConformU 4.3.0 (Build 49708.0503dc7)** on 2026-08-03
-(`python test_conformu.py`):
+Tested with **ConformU 4.3.0 (Build 49708.0503dc7)** on 2026-08-03.
 
-| Device | Errors | Issues | Info | Status |
-|--------|:------:|:------:|:----:|:------:|
-| FLI Camera (Camera #0) | 0 | 0 | 22 | ✓ PASS |
-| FLI Filter Wheel (FilterWheel #0) | 0 | 0 | 6 | ✓ PASS |
+ConformU offers two levels of test, and both were run:
 
-_Errors may be non-zero when no hardware is attached (NotConnectedException is the expected response). **Issues == 0** indicates Alpaca protocol conformance._
+- **`alpacaprotocol`** — Alpaca *protocol* conformance only (HTTP status codes,
+  JSON envelope, ClientID/ClientTransactionID handling, malformed-parameter
+  responses). Does **not** complete real exposures. This is what
+  `tests/test_conformu.py` runs.
+- **`conformance`** — the full ASCOM *interface* test with all members exercised,
+  including real `StartExposure` → `ImageArray` round-trips at every binning
+  level. Run manually against the camera:
+  `conformu conformance http://HOST:PORT/api/v1/camera/0`.
+
+| Test | Device | Backend | Errors | Issues | Result |
+|------|--------|---------|:------:|:------:|:------:|
+| `alpacaprotocol` | Camera #0 | demo (simulated) | 0 | 0 | ✓ PASS |
+| `alpacaprotocol` | FilterWheel #0 | demo (simulated) | 0 | 0 | ✓ PASS |
+| `alpacaprotocol` | Camera #0 | **real ML50100** | 0 | 0 | ✓ PASS |
+| `conformance` (full) | Camera #0 | **real ML50100** | 0 | 0 | ✓ PASS |
+
+The full `conformance` run took real 2-second exposures and read back the
+complete frame at bins 1×1 (8176 × 6132, 50.1 MPix) through 16×16; ConformU
+reported _"your driver passes ASCOM validation"_.
+
+Notes and caveats:
+
+- Real-hardware testing was done on **macOS / Apple Silicon** via a locally-built
+  `libfli.dylib` (see [`sdk/MACOS_BUILD_NOTES.md`](sdk/MACOS_BUILD_NOTES.md)).
+  This exercised the FLI code path, but the production target is Linux — re-run
+  `conformance` there before relying on it.
+- Verified against **one** camera (a MicroLine ML50100, firmware 0204). Three
+  ML50100-specific quirks were fixed to reach this result (fixed-16-bit sensor,
+  no whole-frame grab, and a first-poll exposure-status quirk); other FLI models
+  may behave differently.
+- The filter wheel was tested in **demo mode only** (no FW hardware attached).
+- Pass criterion is **issues == 0**. Errors may be non-zero when a device is not
+  connected (`NotConnectedException` is the expected response).
 <!-- conformu:end -->
 
 ## License
