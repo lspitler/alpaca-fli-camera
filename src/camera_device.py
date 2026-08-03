@@ -186,8 +186,13 @@ class CameraDevice:
         dev = self._dev
         defaults = self._config.defaults
 
-        fli_call(lib.FLISetBitDepth, c_long(dev), c_long(libfli.FLI_MODE_16BIT),
-                 operation="FLISetBitDepth")
+        try:
+            fli_call(lib.FLISetBitDepth, c_long(dev), c_long(libfli.FLI_MODE_16BIT),
+                     operation="FLISetBitDepth")
+        except FLIError:
+            # Some cameras (e.g. MicroLine ML50100) are fixed at 16-bit and
+            # reject FLISetBitDepth with -EINVAL. Readout is 16-bit regardless.
+            logger.warning("FLISetBitDepth not supported; continuing (16-bit)")
         try:
             fli_call(lib.FLISetNFlushes, c_long(dev), c_long(defaults.nflushes),
                      operation="FLISetNFlushes")
@@ -656,17 +661,28 @@ class CameraDevice:
             self._camera_state = CameraState.EXPOSING
             logger.debug(f"exposure started ({duration}s)")
 
+            # The ML50100 firmware reports a spurious timeleft=0 on the FIRST
+            # FLIGetExposureStatus call immediately after FLIExposeFrame (the
+            # next call, ~tens of ms later, returns the true remaining time and
+            # counts down normally). Trusting that first 0 would end the wait
+            # instantly, skip the CameraState.EXPOSING window entirely, and read
+            # out mid-exposure. Guard by also requiring the requested exposure
+            # duration to have elapsed in wall-clock before we accept "done".
             timeleft = c_long()
             timeout = duration + 60.0
             t0 = time.time()
             while True:
                 fli_call(lib.FLIGetExposureStatus, c_long(dev), byref(timeleft),
                          operation="FLIGetExposureStatus")
-                if timeleft.value <= 0:
+                elapsed = time.time() - t0
+                if timeleft.value <= 0 and elapsed >= duration:
                     break
-                if (time.time() - t0) > timeout:
+                if elapsed > timeout:
                     raise RuntimeError(f"Exposure timed out after {timeout}s")
-                time.sleep(min(0.1, timeleft.value / 1000.0))
+                # Sleep until the sooner of the reported remaining time or the
+                # remaining requested duration, capped so state stays responsive.
+                remaining = max(timeleft.value / 1000.0, duration - elapsed)
+                time.sleep(max(0.0, min(0.1, remaining)))
 
             self._camera_state = CameraState.READING
             self._grab_frame()
@@ -681,20 +697,27 @@ class CameraDevice:
             self._image_ready = False
 
     def _grab_frame(self) -> None:
-        """Read the full frame via FLIGrabFrame into a native (H, W) uint16."""
+        """Read the full frame into a native (H, W) uint16 buffer.
+
+        Reads row-by-row with FLIGrabRow rather than FLIGrabFrame: the MicroLine
+        line (e.g. ML50100) rejects FLIGrabFrame with -EINVAL (rc=-22), whereas
+        FLIGrabRow is supported across the libfli camera families. Each call
+        fills one row of ``width`` pixels; we advance the destination pointer by
+        one row (width * 2 bytes) each time.
+        """
         lib = self._lib
         dev = self._dev
         width, height = self._num_x, self._num_y
-        npix = width * height
-        buf = np.empty(npix, dtype=np.uint16)
-        bytes_grabbed = c_size_t()
-        # buf.ctypes.data is an int address accepted by the c_void_p argtype.
-        fli_call(
-            lib.FLIGrabFrame, c_long(dev),
-            buf.ctypes.data,
-            c_size_t(npix * 2), byref(bytes_grabbed),
-            operation="FLIGrabFrame",
-        )
+        buf = np.empty(width * height, dtype=np.uint16)
+        base = buf.ctypes.data
+        row_bytes = width * 2
+        for row in range(height):
+            fli_call(
+                lib.FLIGrabRow, c_long(dev),
+                base + row * row_bytes,
+                c_size_t(width),
+                operation="FLIGrabRow",
+            )
         self._image_buffer = buf.reshape((height, width))
 
     def _exposure_worker_demo(self, duration: float, light: bool) -> None:

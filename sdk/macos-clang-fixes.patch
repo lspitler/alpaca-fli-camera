@@ -1,0 +1,191 @@
+--- a/libfli.c
++++ b/libfli.c
+@@ -187,6 +187,9 @@
+ /* This is for FLI INTERNAL USE ONLY */
+ #ifdef _WIN32
+ long usb_bulktransfer(flidev_t dev, int ep, void *buf, long *len);
++#elif defined(__APPLE__)
++long mac_bulktransfer(flidev_t dev, int ep, void *buf, long *len);
++#define usb_bulktransfer mac_bulktransfer
+ #else
+ long linux_bulktransfer(flidev_t dev, int ep, void *buf, long *len);
+ #define usb_bulktransfer linux_bulktransfer
+--- a/unix/libfli-sys.h
++++ b/unix/libfli-sys.h
+@@ -86,11 +86,9 @@
+ #define USB_GLOB "/dev/ugen*.0" __STRINGIFY(FLI_USB_CMDENDPOINT)
+ #define SERIAL_GLOB "/dev/dty0*"
+ 
+-#define fli_connect mac_fli_connect 
++#define fli_connect mac_fli_connect
+ #define fli_disconnect mac_fli_disconnect
+ #define fli_list mac_fli_list
+-#define unix_fli_lock mac_fli_lock
+-#define unix_fli_unlock	mac_fli_unlock
+ 
+ #else
+ #error "Unknown system"
+@@ -107,11 +105,22 @@
+ long unix_fli_list(flidomain_t domain, char ***names);
+ 
+ #if defined(__APPLE__)
+-#define fli_connect mac_fli_connect 
++/* The macOS USB backend (unix/osx/libfli-usb-sys.c) provides these directly.
++   Declare them here so callers in libfli.c compile under clang's strict
++   (C99+) rules. unix_usbio() calls unix_fli_lock()/unix_fli_unlock() by name,
++   so those are redirected to the mac_* implementations; correspondingly,
++   libfli-sys.c must NOT compile its own unix_fli_lock/unlock on __APPLE__
++   (guarded there) to avoid duplicate symbols. */
++long mac_fli_connect(flidev_t dev, char *name, long domain);
++long mac_fli_disconnect(flidev_t dev);
++long mac_fli_lock(flidev_t dev);
++long mac_fli_unlock(flidev_t dev);
++long mac_fli_list(flidomain_t domain, char ***names);
++#define fli_connect mac_fli_connect
+ #define fli_disconnect mac_fli_disconnect
+ #define fli_list mac_fli_list
+ #define unix_fli_lock mac_fli_lock
+-#define unix_fli_unlock	mac_fli_unlock
++#define unix_fli_unlock mac_fli_unlock
+ #else
+ #define fli_connect unix_fli_connect
+ #define fli_disconnect unix_fli_disconnect
+--- a/unix/libfli-sys.c
++++ b/unix/libfli-sys.c
+@@ -195,6 +195,12 @@
+ 
+   return err;
+ }
++
++/* On macOS the lock/unlock entry points are provided by the osx USB backend
++   (mac_fli_lock/mac_fli_unlock, to which unix_fli_lock/unlock are #defined in
++   libfli-sys.h). Compiling the versions below on __APPLE__ would create a
++   second definition of mac_fli_lock/unlock and fail to link. */
++#if !defined(__APPLE__)
+ 
+ #if defined(_USE_FLOCK_)
+ 
+@@ -358,6 +364,8 @@
+ 
+ #endif /* defined(_USE_FLOCK_) */
+ 
++#endif /* !defined(__APPLE__) */
++
+ long unix_fli_list(flidomain_t domain, char ***names)
+ {
+   *names = NULL;
+--- a/unix/osx/libfli-usb-sys.c
++++ b/unix/osx/libfli-usb-sys.c
+@@ -213,18 +213,19 @@
+         return -ENOMEM;
+     }
+     
+-    if(!(io->fd = open(name, O_RDWR)))
+-    {
+-        return -ENOMEM;
+-    }
+-    
+-    int r;
+-    
++    /* macOS talks to the device through IOKit interfaces (set up in
++       mac_usb_connect), not through a file descriptor. The original
++       open(name, O_RDWR) tried to open the location-id string as a file
++       path -- it always failed (fd = -1) and its error check was inverted.
++       We simply mark the fd invalid and rely on the IOKit path. */
++    io->fd = -1;
++
++    int r;
++
+     // Note: unix_usb_connect is defined to mac_usb_connect in OSX
+-    
++
+     if((r = mac_usb_connect(dev, io, name)) != 0)
+     {
+-        close(io->fd);
+         free(io);
+         return r;
+     }
+@@ -303,14 +304,15 @@
+             break;
+     }
+     
+-    if(close(io->fd))
++    /* io->fd is -1 on macOS (IOKit path, no real fd) -- only close a valid one. */
++    if(io->fd >= 0 && close(io->fd))
+     {
+         if(!err)
+         {
+             err = -errno;
+         }
+     }
+-    
++
+     free(DEVICE->io_data);
+     free(DEVICE->sys_data);
+     
+@@ -450,10 +452,16 @@
+             }
+             
+             char *deviceLocIDName = NULL;
+-            
++
+             asprintf(&deviceLocIDName, "%08x", (unsigned int)locationID);
+-            
+-            if(strcmp(name, deviceLocIDName) == 0)
++
++            /* FLIList() hands back names of the form "<locid>;<model>"
++               (e.g. "01120000;MicroLine ML50100"), and that whole string is
++               passed straight back to FLIOpen(). The device is identified by
++               the location id only, so compare just the part before ';'. */
++            size_t locidlen = strlen(deviceLocIDName);
++            if(strncmp(name, deviceLocIDName, locidlen) == 0 &&
++               (name[locidlen] == '\0' || name[locidlen] == ';'))
+             {
+                 found = true;
+                 
+@@ -876,19 +884,12 @@
+ //==========================================================================
+ long mac_fli_lock(flidev_t dev)
+ {
+-    
+-    fli_unixio_t *io = DEVICE->io_data;
+-    
+-    if(io == NULL)
+-    {
+-        return -ENODEV;
+-    }
+-    
+-    if(!flock(io->fd, LOCK_EX))
+-    {
+-        return -errno;
+-    }
+-    
++    /* On macOS the device is accessed through IOKit pipes, not the fli_unixio_t
++       file descriptor (which is never validly opened here). Exclusive access is
++       already guaranteed by USBDeviceOpenSeize() in mac_usb_connect(), so this
++       lock is a no-op. The original flock(io->fd,...) both used a bogus fd and
++       had inverted success handling (returned -errno on flock success). */
++    (void)dev;
+     return 0;
+ }
+ //-------------------------------------------------------------------------
+@@ -901,17 +902,8 @@
+ //==========================================================================
+ long mac_fli_unlock(flidev_t dev)
+ {
+-    fli_unixio_t *io = DEVICE->io_data;
+-    if(io == NULL)
+-    {
+-        return -ENODEV;
+-    }
+-    
+-    if(!flock(io->fd, LOCK_UN))
+-    {
+-        return -errno;
+-    }
+-    
++    /* No-op counterpart to mac_fli_lock (see note there). */
++    (void)dev;
+     return 0;
+ }
+ //-------------------------------------------------------------------------

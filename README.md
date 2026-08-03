@@ -128,7 +128,15 @@ attached (a disconnected device correctly returns `NotConnectedException`).
 ## ASCOM Conformance
 
 <!-- conformu:start -->
-Not yet run in this checkout. Run `python tests/test_conformu.py` to populate.
+Last tested with **ConformU 4.3.0 (Build 49708.0503dc7)** on 2026-08-03
+(`python test_conformu.py`):
+
+| Device | Errors | Issues | Info | Status |
+|--------|:------:|:------:|:----:|:------:|
+| FLI Camera (Camera #0) | 0 | 0 | 22 | ✓ PASS |
+| FLI Filter Wheel (FilterWheel #0) | 0 | 0 | 6 | ✓ PASS |
+
+_Errors may be non-zero when no hardware is attached (NotConnectedException is the expected response). **Issues == 0** indicates Alpaca protocol conformance._
 <!-- conformu:end -->
 
 ## License

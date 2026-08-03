@@ -27,3 +27,7 @@ tests/*.fits
 .DS_Store
 # local editor/agent settings
 .claude/
+# local machine-specific run configs (absolute paths, hardware selection)
+config.hw.yaml
+config.*.yaml
+config.yaml.*bak
