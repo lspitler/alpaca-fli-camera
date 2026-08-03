@@ -1,3 +1,10 @@
+macOS/clang build fixes for the libfli SDK. See sdk/MACOS_BUILD_NOTES.md.
+Apply against a vendor libfli-1.104 tree:  patch -p1 < macos-clang-fixes.patch
+
+Context lines are excerpts of libfli (c) 2000, 2002 Finger Lakes Instrumentation,
+L.L.C., BSD 3-Clause; that copyright/license is retained. Only +/- lines are
+contributed here (also BSD 3-Clause).
+
 --- a/libfli.c
 +++ b/libfli.c
 @@ -187,6 +187,9 @@

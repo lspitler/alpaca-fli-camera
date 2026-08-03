@@ -1,5 +1,12 @@
 # Building libfli on macOS (Apple Silicon)
 
+> **License note:** `macos-clang-fixes.patch` modifies FLI's `libfli` sources
+> (Copyright © 2000, 2002 Finger Lakes Instrumentation, L.L.C.), which are
+> distributed under the BSD 3-Clause License; those copyright/license headers are
+> retained and only the marked `+/-` lines are contributed here (also BSD 3-Clause,
+> see the repo `LICENSE`). The FLI SDK sources themselves are not redistributed —
+> download them from <https://www.flicamera.com/support>.
+
 FLI's `libfli-1.104` ships a macOS USB backend (`unix/osx/libfli-usb-sys.c`) that
 talks to the camera through **IOKit in userspace** — so, unlike Linux, macOS needs
 **no kernel module** (`fliusb`) to reach the device. However, that backend is from
