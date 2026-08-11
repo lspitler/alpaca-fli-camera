@@ -1,0 +1,178 @@
+Linux kernel 5.4-7.x build fixes for the FLI fliusb kernel module (v1.5).
+Apply against a vendor fliusb-1.5 tree:  patch -p1 < linux-kernel-fixes.patch
+
+The vendor 1.5 source targets kernel 4.18. These hunks carry it forward across
+the API changes since then; each is version-guarded, so the result still builds
+on older kernels. Verified on 7.0.0-29-generic (Ubuntu, x86_64) against a
+MicroLine ML50100.
+
+  kbuild       SUBDIRS= was removed in 5.4          -> M=
+               EXTRA_CFLAGS is no longer honoured   -> ccflags-y
+  6.1          usb_maxpacket() lost its is_out arg  -> fliusb_maxpacket()
+  5.8          mm->mmap_sem became mm->mmap_lock    -> fliusb_mmap_read_lock()
+  6.5          get_user_pages() lost its vmas arg   -> fliusb_get_user_pages()
+  6.16         del_timer_sync() -> timer_delete_sync -> fliusb_del_timer_sync()
+  2.6.35       usb_buffer_alloc/free renamed        -> usb_alloc/free_coherent
+               (only reached when ASYNCWRITE is enabled)
+
+-DDEBUG is also turned off: it logs one printk per USB bulk transfer, and a
+full-frame read is one transfer per row (~6100 on an ML50100), which floods the
+kernel ring buffer and evicts all other messages.
+
+Context lines are excerpts of fliusb (c) Finger Lakes Instrumentation, L.L.C.,
+BSD-licensed; that copyright/license is retained. Only +/- lines are
+contributed here (also BSD).
+
+--- a/Makefile
++++ b/Makefile
+@@ -3,16 +3,20 @@
+ KDIR		?= /lib/modules/$(shell uname -r)/build
+ PWD		:= $(shell pwd)
+ 
+-EXTRA_CFLAGS		+= -O2 -Wall
++# ccflags-y replaces EXTRA_CFLAGS, which modern kbuild no longer honours.
++ccflags-y		+= -O2 -Wall
+ 
+-EXTRA_CFLAGS		+= -DDEBUG	# enable debug messages
+-#EXTRA_CFLAGS		+= -DASYNCWRITE	# enable asynchronous writes
+-EXTRA_CFLAGS		+= -DSGREAD	# enable scatter-gather reads
++# -DDEBUG logs one printk per USB bulk transfer. A full-frame read is one
++# transfer per row (~6100 on an ML50100), which floods the kernel ring buffer
++# and evicts everything else. Enable only for driver debugging.
++#ccflags-y		+= -DDEBUG	# enable debug messages
++#ccflags-y		+= -DASYNCWRITE	# enable asynchronous writes
++ccflags-y		+= -DSGREAD	# enable scatter-gather reads
+ 
+ all: module cleanup
+ 
+ module:
+-	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) modules
++	$(MAKE) -C $(KDIR) M=$(PWD) modules
+ 
+ cleanup:
+ 	rm -f *.o .*.cmd *.mod.c; rm -rf .tmp_versions
+--- a/fliusb.c
++++ b/fliusb.c
+@@ -71,7 +71,50 @@
+ 
+ #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 36) && !defined(init_MUTEX)
+ #define init_MUTEX(sem)	sema_init(sem, 1)
+-#endif 
++#endif
++
++/* Compatibility shims for kernels newer than this driver's 4.18 target. */
++
++/* usb_maxpacket() lost its third ("is_out") argument in 6.1; the direction is
++   derived from the pipe, so the argument is simply dropped. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
++#define fliusb_maxpacket(udev, pipe, is_out)	usb_maxpacket(udev, pipe)
++#else
++#define fliusb_maxpacket(udev, pipe, is_out)	usb_maxpacket(udev, pipe, is_out)
++#endif
++
++/* mm->mmap_sem became mm->mmap_lock in 5.8, with dedicated accessors. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
++#define fliusb_mmap_read_lock(mm)	mmap_read_lock(mm)
++#define fliusb_mmap_read_unlock(mm)	mmap_read_unlock(mm)
++#else
++#define fliusb_mmap_read_lock(mm)	down_read(&(mm)->mmap_sem)
++#define fliusb_mmap_read_unlock(mm)	up_read(&(mm)->mmap_sem)
++#endif
++
++/* get_user_pages() dropped its trailing "vmas" argument in 6.5. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 5, 0)
++#define fliusb_get_user_pages(start, n, flags, pages)	\
++  get_user_pages(start, n, flags, pages)
++#else
++#define fliusb_get_user_pages(start, n, flags, pages)	\
++  get_user_pages(start, n, flags, pages, NULL)
++#endif
++
++/* del_timer_sync() was renamed timer_delete_sync() in 6.16. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
++#define fliusb_del_timer_sync(t)	timer_delete_sync(t)
++#else
++#define fliusb_del_timer_sync(t)	del_timer_sync(t)
++#endif
++
++/* usb_buffer_alloc()/usb_buffer_free() were renamed usb_alloc_coherent()/
++   usb_free_coherent() in 2.6.35 and later removed. Only reached with
++   ASYNCWRITE enabled. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 35)
++#define usb_buffer_alloc	usb_alloc_coherent
++#define usb_buffer_free		usb_free_coherent
++#endif
+ 
+ struct mutex fliusb_mutex;
+ 
+@@ -318,9 +361,9 @@
+   /* userbuffer must be aligned to a multiple of the endpoint's
+      maximum packet size
+   */
+-  if ((size_t)userbuffer % usb_maxpacket(dev->usbdev, pipe, 0))
++  if ((size_t)userbuffer % fliusb_maxpacket(dev->usbdev, pipe, 0))
+   {
+-    FLIUSB_ERR("user buffer is not properly aligned: 0x%p %% 0x%04x", userbuffer, usb_maxpacket(dev->usbdev, pipe, 0));
++    FLIUSB_ERR("user buffer is not properly aligned: 0x%p %% 0x%04x", userbuffer, fliusb_maxpacket(dev->usbdev, pipe, 0));
+     return -EINVAL;
+   }
+ 
+@@ -335,10 +378,10 @@
+   if (down_interruptible(&dev->usbsg.sem))
+     return -ERESTARTSYS;
+ 
+-  down_read(&current->mm->mmap_sem);
+-  numpg = get_user_pages((size_t)userbuffer & PAGE_MASK,
+-			 numpg, FOLL_WRITE, dev->usbsg.userpg, NULL);
+-  up_read(&current->mm->mmap_sem);
++  fliusb_mmap_read_lock(current->mm);
++  numpg = fliusb_get_user_pages((size_t)userbuffer & PAGE_MASK,
++			 numpg, FOLL_WRITE, dev->usbsg.userpg);
++  fliusb_mmap_read_unlock(current->mm);
+ 
+   if (numpg <= 0)
+   {
+@@ -397,7 +440,7 @@
+   /* wait for the transfer to complete */
+   usb_sg_wait(&s_sgreq);
+ 
+-  del_timer_sync(&dev->usbsg.timer);
++  fliusb_del_timer_sync(&dev->usbsg.timer);
+ 
+   if (s_sgreq.status)
+   {
+@@ -660,7 +703,7 @@
+     if (__get_user(tmp.uint8, (u_int8_t __user *)arg))
+       return -EFAULT;
+     tmppipe = usb_rcvbulkpipe(dev->usbdev, tmp.uint8);
+-    if (usb_maxpacket(dev->usbdev, tmppipe, 0) == 0)
++    if (fliusb_maxpacket(dev->usbdev, tmppipe, 0) == 0)
+     {
+       FLIUSB_ERR("invalid read USB bulk transfer endpoint address: 0x%02x",
+ 		 tmp.uint8);
+@@ -674,7 +717,7 @@
+     if (__get_user(tmp.uint8, (u_int8_t __user *)arg))
+       return -EFAULT;
+     tmppipe = usb_sndbulkpipe(dev->usbdev, tmp.uint8);
+-    if (usb_maxpacket(dev->usbdev, tmppipe, 1) == 0)
++    if (fliusb_maxpacket(dev->usbdev, tmppipe, 1) == 0)
+     {
+       FLIUSB_ERR("invalid write USB bulk transfer endpoint address: 0x%02x",
+ 		 tmp.uint8);
+@@ -832,14 +875,14 @@
+   }
+ 
+   /* Check that the endpoints exist */
+-  if (usb_maxpacket(tmpdev->usbdev, tmpdev->rdbulkpipe, 0) == 0)
++  if (fliusb_maxpacket(tmpdev->usbdev, tmpdev->rdbulkpipe, 0) == 0)
+   {
+     FLIUSB_ERR("invalid read USB bulk transfer endpoint address: 0x%02x",
+ 	       usb_pipeendpoint(tmpdev->rdbulkpipe) | USB_DIR_IN);
+     err = -ENXIO;
+     goto fail;
+   }
+-  if (usb_maxpacket(tmpdev->usbdev, tmpdev->wrbulkpipe, 1) == 0)
++  if (fliusb_maxpacket(tmpdev->usbdev, tmpdev->wrbulkpipe, 1) == 0)
+   {
+     FLIUSB_ERR("invalid write USB bulk transfer endpoint address: 0x%02x",
+ 	       usb_pipeendpoint(tmpdev->wrbulkpipe) | USB_DIR_OUT);

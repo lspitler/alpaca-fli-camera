@@ -11,6 +11,7 @@ alpyca.log
 # sources and archives are not.
 sdk/libfli-1.104/
 sdk/fliusb-1.3.2/
+sdk/fliusb-1.5/
 *.zip
 *.tar
 680ba56de788273e3783cad5_FLI_SDK_Documentation.pdf
