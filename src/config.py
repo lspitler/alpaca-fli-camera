@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -5,20 +6,37 @@ import yaml
 from pydantic import BaseModel, Field
 
 
+#: Config files actually loaded, in merge order. Populated by
+#: _load_yaml_configs() so startup can report which file supplied what.
+LOADED_CONFIG_PATHS: List[Path] = []
+
+
 def _load_yaml_configs() -> dict:
-    """Load config.yaml with optional docker override at /alpyca/config.yaml."""
-    base_config = {}
-    override_config = {}
+    """Load config.yaml, then layer any overrides on top of it.
 
-    base_path = Path(__file__).parent.parent / "config.yaml"
-    if base_path.exists():
-        with open(base_path, "r") as f:
-            base_config = yaml.safe_load(f) or {}
+    Merge order (later wins, missing files are skipped):
 
-    docker_path = Path("/alpyca/config.yaml")
-    if docker_path.exists():
-        with open(docker_path, "r") as f:
-            override_config = yaml.safe_load(f) or {}
+    1. ``config.yaml``          tracked repo defaults (ships with ``demo: true``)
+    2. ``config.hw.yaml``       optional, gitignored: this machine's hardware
+    3. ``/alpyca/config.yaml``  docker mount
+    4. ``$FLI_CONFIG``          optional explicit path, wins over everything
+
+    Keeping machine-specific settings (serial numbers, absolute library paths)
+    in ``config.hw.yaml`` leaves ``config.yaml`` clean in git.
+
+    Note that dicts merge key-by-key but lists are replaced wholesale, so an
+    override file that touches ``cameras:`` must list every camera it wants.
+    """
+    repo_root = Path(__file__).parent.parent
+
+    candidates = [
+        repo_root / "config.yaml",
+        repo_root / "config.hw.yaml",
+        Path("/alpyca/config.yaml"),
+    ]
+    env_path = os.environ.get("FLI_CONFIG")
+    if env_path:
+        candidates.append(Path(env_path))
 
     def deep_merge(base: dict, override: dict) -> dict:
         result = base.copy()
@@ -29,7 +47,21 @@ def _load_yaml_configs() -> dict:
                 result[key] = value
         return result
 
-    return deep_merge(base_config, override_config)
+    LOADED_CONFIG_PATHS.clear()
+    merged: dict = {}
+    for path in candidates:
+        if not path.exists():
+            continue
+        with open(path, "r") as f:
+            merged = deep_merge(merged, yaml.safe_load(f) or {})
+        LOADED_CONFIG_PATHS.append(path)
+
+    # An explicitly requested config that does not exist is a mistake worth
+    # reporting rather than silently ignoring.
+    if env_path and not Path(env_path).exists():
+        raise FileNotFoundError(f"FLI_CONFIG points at a missing file: {env_path}")
+
+    return merged
 
 
 class CameraDefaults(BaseModel):

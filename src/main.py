@@ -22,7 +22,7 @@ import filterwheel
 import management
 import setup
 from camera_device import CameraDevice
-from config import config
+from config import LOADED_CONFIG_PATHS, config
 from discovery import DiscoveryResponder
 from filterwheel_device import FilterWheelDevice
 from log import get_logger, setup_logging
@@ -40,6 +40,7 @@ filterwheel_devices: Dict[int, FilterWheelDevice] = {}
 async def lifespan(app: FastAPI):
     """Application lifespan manager - startup and shutdown."""
     logger.info(f"Starting {config.entity} on {config.server.host}:{config.server.port}")
+    logger.info(f"Config: {', '.join(str(p) for p in LOADED_CONFIG_PATHS) or 'defaults only'}")
 
     for cam_config in config.cameras:
         cam = CameraDevice(cam_config, config.library)
