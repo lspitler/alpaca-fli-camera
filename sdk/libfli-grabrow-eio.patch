@@ -1,0 +1,47 @@
+Make FLIGrabRow report a failed image download instead of returning success
+over a zero-filled buffer.
+
+libfli's ProLine/MicroLine grab path sets a local `abort` flag when the bulk
+read on the image endpoint fails, then falls out of the switch and returns 0
+regardless -- having already memset the grab buffer at libfli-camera-usb.c:1504.
+Callers therefore see rc == 0 and a frame of all zeros, and nothing raises: a
+failed download is indistinguishable from a legitimately dark image. This is
+how blank frames reached ASCOM clients while every size-only assertion passed.
+
+Same fix INDI carries in its bundled copy of libfli (indi-3rdparty/libfli):
+hoist `abort` to function scope and return -EIO when it is set. With it,
+fli_call() raises FLIError and the server reports the exposure as failed.
+
+Apply with:  cd sdk && patch -p1 < libfli-grabrow-eio.patch
+
+--- a/libfli-1.104/libfli-camera-usb.c
++++ b/libfli-1.104/libfli-camera-usb.c
+@@ -1030,6 +1030,7 @@
+ long fli_camera_usb_grab_row(flidev_t dev, void *buff, size_t width)
+ {
+   flicamdata_t *cam = DEVICE->device_data;
++  int abort = 0;
+ 
+ 	if(width > (size_t) (cam->image_area.lr.x - cam->image_area.ul.x))
+ 	{
+@@ -1287,7 +1288,7 @@
+ 		case FLIUSB_PROLINE_ID:
+ 		{
+ 			long rlen = 0, rtotal = 0;
+-			int abort = 0, index = 0;
++			int index = 0;
+ 
+ 			/*
+ 			 * cam->gbuf_siz -- size of the grab buffer (bytes)
+@@ -1720,6 +1721,11 @@
+ 			break;
+ 	}
+ 
++	if(abort)
++	{
++		return -EIO;
++	}
++
+ 	return 0;
+ }
+ 

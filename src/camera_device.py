@@ -708,17 +708,51 @@ class CameraDevice:
         lib = self._lib
         dev = self._dev
         width, height = self._num_x, self._num_y
-        buf = np.empty(width * height, dtype=np.uint16)
+        # zeros, not empty: on a failed download the buffer must not be
+        # mistakable for pixel data (see the all-zero check below).
+        buf = np.zeros(width * height, dtype=np.uint16)
         base = buf.ctypes.data
         row_bytes = width * 2
         for row in range(height):
-            fli_call(
-                lib.FLIGrabRow, c_long(dev),
-                base + row * row_bytes,
-                c_size_t(width),
-                operation="FLIGrabRow",
+            try:
+                fli_call(
+                    lib.FLIGrabRow, c_long(dev),
+                    base + row * row_bytes,
+                    c_size_t(width),
+                    operation="FLIGrabRow",
+                )
+            except FLIError as e:
+                raise FLIError(
+                    f"FLIGrabRow (row {row}/{height}, "
+                    f"{self._device_status_str()})", e.rc
+                ) from e
+
+        # A download that fails without reporting it is worse than an error:
+        # unpatched libfli returns rc == 0 from FLIGrabRow after memset'ing its
+        # grab buffer, so a camera that never delivers pixels yields a perfectly
+        # well-formed frame of zeros and every size-only check passes. A real CCD
+        # never reads back as exactly zero everywhere -- bias level and read
+        # noise guarantee otherwise -- so treat it as the failure it is.
+        if not buf.any():
+            raise RuntimeError(
+                f"image download produced an all-zero {width}x{height} frame "
+                f"({self._device_status_str()}) — the camera did not deliver "
+                f"pixel data. See 'Known issue: blank frames' in README.md"
             )
         self._image_buffer = buf.reshape((height, width))
+
+    def _device_status_str(self) -> str:
+        """Camera status word, for diagnostics in download-failure messages."""
+        try:
+            status = c_long()
+            fli_call(self._lib.FLIGetDeviceStatus, c_long(self._dev),
+                     byref(status), operation="FLIGetDeviceStatus")
+            raw = status.value & 0xFFFFFFFF
+            state = ("IDLE", "WAITING_FOR_TRIGGER", "EXPOSING", "READING_CCD")[raw & 0x3]
+            ready = "DATA_READY" if raw & 0x80000000 else "no DATA_READY"
+            return f"status=0x{raw:08x} {state}, {ready}"
+        except Exception:
+            return "status unavailable"
 
     def _exposure_worker_demo(self, duration: float, light: bool) -> None:
         self._camera_state = CameraState.EXPOSING
