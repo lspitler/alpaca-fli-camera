@@ -35,7 +35,8 @@ src/
 ├── filterwheel_device.py FLI FilterWheelDevice (+ demo backend)
 ├── management.py setup.py discovery.py responses.py exceptions.py shr.py log.py
 sdk/                      build_libfli.sh + README (FLI SDK downloaded here, not committed)
-tests/                    test.py (smoke), test_conformu.py (ConformU runner)
+tests/                    test.py (smoke), test_pixels.py (pixel content),
+                          test_conformu.py (ConformU runner)
 ```
 
 ## Quick start (demo mode, no hardware — macOS/Linux)
@@ -50,9 +51,15 @@ In another shell:
 
 ```bash
 python tests/test.py          # HTTP smoke test of camera + filter wheel
+python tests/test_pixels.py   # are the pixels real, or a well-formed blank?
 # or poke it directly:
 curl -s localhost:5555/management/v1/configureddevices
 ```
+
+`tests/test_pixels.py` is the one check that looks at image *content* rather than
+its dimensions — it exists because a camera can pass everything else while
+returning nothing but zeros (see "Known issue: blank frames on Linux"). Run it
+against real hardware with `--full` and `--bin N` to cover the whole sensor.
 
 ## Running against real hardware (Linux)
 
@@ -140,6 +147,10 @@ python tests/test_conformu.py     # starts the server, runs both devices,
 
 Pass criterion is **issues == 0**. Errors may be non-zero without hardware
 attached (a disconnected device correctly returns `NotConnectedException`).
+
+ConformU does not look at pixel values, so pair it with
+`python tests/test_pixels.py` on real hardware — that is the check that would
+have caught this box's blank frames.
 
 ---
 
