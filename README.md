@@ -91,7 +91,32 @@ against real hardware with `--full` and `--bin N` to cover the whole sensor.
    each device's `demo: false`, and fill in the real `serial_number` (or
    `model` / `device_index`).
 
-4. **Run**: `python src/main.py`  (or use the `Dockerfile`).
+4. **Run**: `python src/main.py`  (or use the `Dockerfile` — see below).
+
+### Docker
+
+```bash
+docker build -t alpaca-fli .
+docker run --rm --network host \
+  --device /dev/fliusb0 \
+  -v /path/to/config.yaml:/alpyca/config.yaml:ro \
+  alpaca-fli
+```
+
+The image **compiles its own `libfli.so`** from `sdk/libfli-*/` and installs it
+at `/usr/local/lib/libfli.so`, which is where `config.yaml`'s default `library:`
+already points — so there is no library to mount. Step 1 above is still the
+prerequisite: the vendor SDK is not in this repo, and without it in the build
+context the image builds but runs demo mode only (the build log says so). The
+`fliusb` module from step 2 must be loaded on the **host**; the container needs
+only the device node, which is why no `--privileged` is required.
+
+Do **not** bind-mount a host-built `sdk/libfli.so` into the container. It is
+dlopened through ctypes, so it has to match the *container's* glibc, not the
+host's — a host object from a newer distro fails with ``version `GLIBC_2.42'
+not found``, and because the library loads on `PUT /connected` rather than at
+startup, the server log looks healthy while the symptom reads like a camera
+fault. The host-built object remains the correct one for running bare-metal.
 
 ## Configuration
 
@@ -114,6 +139,37 @@ missing files are skipped:
 Dicts merge key-by-key, but **lists are replaced wholesale** — an override file
 that sets `cameras:` must repeat every field of the entries it replaces.
 Startup logs which files were loaded.
+
+### Cooling and the set-point
+
+libfli exposes **only a set-point** — `FLISetTemperature` — with no cooler
+on/off and no way to read the set-point back. Everything else is built on that
+one call, which has three consequences worth knowing before you trust a
+temperature:
+
+- **`CoolerOn` is emulated.** True pushes `defaults.temperature`; false pushes
+  `warm_temperature` (25 °C by default). "Off" therefore means *asked to sit
+  warm*, not *TEC unpowered*.
+- **Setting `SetCCDTemperature` while `CoolerOn` is false changes nothing on the
+  camera.** The value is stored and takes effect when the cooler is switched on.
+  This is correct ASCOM behaviour, but it does mean the obvious one-liner —
+  `PUT setccdtemperature` and wait — silently never cools. Order matters:
+  `PUT cooleron=true`, then `PUT setccdtemperature`.
+- **`CoolerOn` reflects this server's cached flag, not the hardware.** After a
+  restart it is whatever config says, which need not match the set-point the
+  camera is actually holding. libfli offers no readback to reconcile it.
+
+`config.yaml` ships `cooler_on: false`, so a freshly connected camera is asked
+to sit at 25 °C. For calibration work — darks especially — engage the cooler
+explicitly and **wait for the temperature to stabilise** rather than assuming
+the set-point is reached the moment it is accepted.
+
+The accepted range is −55…+45 °C, but that is an API limit, not a capability:
+the achievable floor is a fixed TEC delta below the heatsink and so depends on
+ambient. **`CoolerPower` is the headroom readout** — measured on this rig
+(ML50100, ambient ≈ 9.4 °C) a −20 °C set-point holds at **78 %**, so a few more
+degrees are available and −40 °C is not. Power pinned near 100 % with the
+temperature short of target means the floor has been hit.
 
 ## Camera capability matrix (ICameraV4)
 
