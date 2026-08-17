@@ -11,6 +11,7 @@ Shared FLI helpers used by both the camera and filter-wheel device classes.
 
 import os
 from ctypes import CDLL, byref, c_long, create_string_buffer
+from threading import RLock
 from typing import List, Optional, Tuple
 
 import libfli
@@ -19,6 +20,42 @@ from log import get_logger
 logger = get_logger()
 
 _BUF = 256  # generic string-output buffer size
+
+# libfli is not thread-safe. It keeps static per-library state, and every call is
+# a request/response transaction over a single USB endpoint. Two threads calling
+# it concurrently interleave those transactions and one thread reads the other's
+# reply, which surfaces as a nonsense errno on whichever call loses the race and
+# leaves the camera latched in CameraState.ERROR. Measured on the ML50100:
+# polling CCDTemperature at 4 Hz against an exposure turned a known-good 60 s
+# dark into "FLIGetTemperature failed: EOVERFLOW (rc=-75)" plus "FLIExposeFrame
+# failed: EAGAIN (rc=-11)" from one collision. rc=-22 (EINVAL) and rc=-110
+# (ETIMEDOUT) on other calls are the same bug seen from a different side. The
+# bogus code names whichever call lost, so it reads like an unrelated hardware
+# limit -- do not chase the errno.
+#
+# The Alpaca server is inherently concurrent here: ccd_temperature and
+# cooler_power are property getters served on the HTTP threadpool, while the
+# exposure worker polls FLIGetExposureStatus from its own thread on the same
+# handle. Any client with a housekeeping loop (SensorKit polls temperature and
+# cooler power once a second) therefore races every exposure it takes.
+#
+# All runtime libfli traffic goes through fli_call or read_string, so
+# serialising here covers it. Reentrant so a caller can hold fli_lock() across a
+# multi-call sequence that must be atomic -- frame setup, row-by-row readout --
+# without deadlocking on the inner calls.
+_LIB_LOCK = RLock()
+
+
+def fli_lock() -> RLock:
+    """The libfli serialisation lock.
+
+    Use as a context manager around a sequence of libfli calls that must not be
+    interleaved with another thread's, e.g. the FLIGrabRow readout loop. Single
+    calls need no explicit locking: ``fli_call`` and ``read_string`` take it
+    themselves. Never hold it across a wait for the hardware (an exposure
+    countdown), or housekeeping reads block for the whole exposure.
+    """
+    return _LIB_LOCK
 
 
 class FLIError(Exception):
@@ -39,8 +76,12 @@ class FLIError(Exception):
 
 
 def fli_call(func, *args, operation: str = "") -> int:
-    """Invoke a libfli function; raise ``FLIError`` on a non-zero return."""
-    rc = func(*args)
+    """Invoke a libfli function; raise ``FLIError`` on a non-zero return.
+
+    Serialised against all other libfli access -- see ``_LIB_LOCK``.
+    """
+    with _LIB_LOCK:
+        rc = func(*args)
     if rc != 0:
         raise FLIError(operation or getattr(func, "__name__", "FLI call"), rc)
     return rc
@@ -54,26 +95,29 @@ def enumerate_devices(lib: CDLL, domain: int) -> List[Tuple[str, str]]:
     filename is what ``FLIOpen`` needs; the model is the human-readable name.
     """
     devices: List[Tuple[str, str]] = []
-    fli_call(lib.FLICreateList, c_long(domain), operation="FLICreateList")
-    try:
-        found_domain = c_long()
-        fname = create_string_buffer(_BUF)
-        name = create_string_buffer(_BUF)
+    # The list API is libfli-global state, not per-device: hold the lock across
+    # the whole walk so a concurrent enumeration or device call cannot tear it.
+    with _LIB_LOCK:
+        fli_call(lib.FLICreateList, c_long(domain), operation="FLICreateList")
+        try:
+            found_domain = c_long()
+            fname = create_string_buffer(_BUF)
+            name = create_string_buffer(_BUF)
 
-        rc = lib.FLIListFirst(
-            byref(found_domain), fname, _BUF, name, _BUF
-        )
-        while rc == 0:
-            devices.append(
-                (fname.value.decode(errors="replace"),
-                 name.value.decode(errors="replace"))
-            )
-            rc = lib.FLIListNext(
+            rc = lib.FLIListFirst(
                 byref(found_domain), fname, _BUF, name, _BUF
             )
-    finally:
-        # FLIDeleteList frees the internal list; ignore its return.
-        lib.FLIDeleteList()
+            while rc == 0:
+                devices.append(
+                    (fname.value.decode(errors="replace"),
+                     name.value.decode(errors="replace"))
+                )
+                rc = lib.FLIListNext(
+                    byref(found_domain), fname, _BUF, name, _BUF
+                )
+        finally:
+            # FLIDeleteList frees the internal list; ignore its return.
+            lib.FLIDeleteList()
 
     logger.debug(f"enumerate_devices(domain=0x{domain:x}) -> {devices}")
     return devices
@@ -152,7 +196,8 @@ def read_string(func, dev: int, *extra, bufsize: int = _BUF) -> str:
     """Call a libfli ``(dev[, extra], char *buf, size_t len)`` getter -> str."""
     buf = create_string_buffer(bufsize)
     args = [c_long(dev), *extra, buf, bufsize]
-    rc = func(*args)
+    with _LIB_LOCK:
+        rc = func(*args)
     if rc != 0:
         raise FLIError(getattr(func, "__name__", "FLI string getter"), rc)
     return buf.value.decode(errors="replace").strip()
@@ -160,7 +205,8 @@ def read_string(func, dev: int, *extra, bufsize: int = _BUF) -> str:
 
 def get_lib_version(lib: CDLL) -> str:
     buf = create_string_buffer(_BUF)
-    rc = lib.FLIGetLibVersion(buf, _BUF)
+    with _LIB_LOCK:
+        rc = lib.FLIGetLibVersion(buf, _BUF)
     if rc != 0:
         return "unknown"
     return buf.value.decode(errors="replace").strip()

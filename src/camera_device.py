@@ -23,7 +23,7 @@ import time
 from ctypes import byref, c_double, c_long, c_size_t, create_string_buffer
 from datetime import datetime, timezone
 from enum import IntEnum
-from threading import Event, Lock, Thread
+from threading import Event, Thread
 from typing import List, Optional
 
 import numpy as np
@@ -31,7 +31,7 @@ from astropy.time import Time
 
 import libfli
 from config import CameraConfig
-from fli_common import FLIError, fli_call, open_device, read_string
+from fli_common import FLIError, fli_call, fli_lock, open_device, read_string
 from log import get_logger
 
 logger = get_logger()
@@ -56,7 +56,6 @@ class CameraDevice:
     """Low-level driver for FLI CCD cameras (libfli)."""
 
     def __init__(self, device_config: CameraConfig, library_path: str):
-        self._lock = Lock()
         self._config = device_config
         self._library_path = library_path
         self._demo = device_config.demo
@@ -648,16 +647,22 @@ class CameraDevice:
 
             lib = self._lib
             dev = self._dev
-            self._apply_roi()
-            fli_call(lib.FLISetFrameType, c_long(dev),
-                     c_long(libfli.FLI_FRAME_TYPE_NORMAL if light
-                            else libfli.FLI_FRAME_TYPE_DARK),
-                     operation="FLISetFrameType")
-            fli_call(lib.FLISetExposureTime, c_long(dev),
-                     c_long(int(round(duration * 1000.0))),
-                     operation="FLISetExposureTime")
+            # Atomic: binning, ROI, frame type and exposure time are separate
+            # transactions that together define the frame FLIExposeFrame starts.
+            # A housekeeping read landing between them races the setup itself --
+            # that is where EAGAIN (rc=-11) on FLIExposeFrame comes from.
+            with fli_lock():
+                self._apply_roi()
+                fli_call(lib.FLISetFrameType, c_long(dev),
+                         c_long(libfli.FLI_FRAME_TYPE_NORMAL if light
+                                else libfli.FLI_FRAME_TYPE_DARK),
+                         operation="FLISetFrameType")
+                fli_call(lib.FLISetExposureTime, c_long(dev),
+                         c_long(int(round(duration * 1000.0))),
+                         operation="FLISetExposureTime")
 
-            fli_call(lib.FLIExposeFrame, c_long(dev), operation="FLIExposeFrame")
+                fli_call(lib.FLIExposeFrame, c_long(dev),
+                         operation="FLIExposeFrame")
             self._camera_state = CameraState.EXPOSING
             logger.debug(f"exposure started ({duration}s)")
 
@@ -713,19 +718,26 @@ class CameraDevice:
         buf = np.zeros(width * height, dtype=np.uint16)
         base = buf.ctypes.data
         row_bytes = width * 2
-        for row in range(height):
-            try:
-                fli_call(
-                    lib.FLIGrabRow, c_long(dev),
-                    base + row * row_bytes,
-                    c_size_t(width),
-                    operation="FLIGrabRow",
-                )
-            except FLIError as e:
-                raise FLIError(
-                    f"FLIGrabRow (row {row}/{height}, "
-                    f"{self._device_status_str()})", e.rc
-                ) from e
+        # Atomic across all rows: the readout is one stateful sequence over the
+        # USB endpoint, and libfli tracks how far through the frame it is. A
+        # control transaction squeezed between two rows desynchronises it, which
+        # is how a readout comes back shifted, EREMOTEIO, or filled with 0xFFFF.
+        # This blocks housekeeping reads for the readout (~5 s on a full frame);
+        # that is the correct trade against corrupting the frame.
+        with fli_lock():
+            for row in range(height):
+                try:
+                    fli_call(
+                        lib.FLIGrabRow, c_long(dev),
+                        base + row * row_bytes,
+                        c_size_t(width),
+                        operation="FLIGrabRow",
+                    )
+                except FLIError as e:
+                    raise FLIError(
+                        f"FLIGrabRow (row {row}/{height}, "
+                        f"{self._device_status_str()})", e.rc
+                    ) from e
 
         # A download that fails without reporting it is worse than an error:
         # unpatched libfli returns rc == 0 from FLIGrabRow after memset'ing its
