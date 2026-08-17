@@ -576,9 +576,38 @@ class CameraDevice:
     ###################
     # ICamera methods #
     ###################
+    def _clear_error_state(self) -> None:
+        """Recover from a latched ERROR so the next exposure can proceed.
+
+        A failed exposure worker leaves ``_camera_state == ERROR`` while
+        ``_connected`` stays True, and nothing used to clear it: start_exposure
+        rejected every non-IDLE state, abort_exposure ignored ERROR, and a
+        client's reconnect logic is typically gated on Connected -- which is
+        still True. SensorKit's is (sensorkit/alpaca/device.py, require_connected
+        returns early when device_connected). So one transient fault rejected
+        every later exposure with "Camera is not idle" until the server was
+        restarted: 54 consecutive collects were lost that way on 2026-08-17,
+        which is a whole night on a rig nobody is sitting next to.
+
+        ERROR here is transient driver state, not a hardware verdict, so treat
+        the next StartExposure as the retry. Only clear it once the worker
+        thread has actually finished -- while it is alive the device handle may
+        be mid-transaction, and reusing it would be the very race the _LIB_LOCK
+        in fli_common exists to prevent.
+        """
+        if self._camera_state != CameraState.ERROR:
+            return
+        thread = self._exposure_thread
+        if thread is not None and thread.is_alive():
+            return
+        logger.warning("Clearing latched ERROR state; retrying exposure from IDLE")
+        self._image_ready = False
+        self._camera_state = CameraState.IDLE
+
     def start_exposure(self, duration: float, light: bool) -> None:
+        self._clear_error_state()
         if self._camera_state != CameraState.IDLE:
-            raise RuntimeError("Camera is not idle")
+            raise RuntimeError(f"Camera is not idle (state {self._camera_state.name})")
         if duration < 0:
             raise ValueError(f"Duration {duration} must be >= 0")
         if duration > self._exposure_max:
@@ -700,6 +729,10 @@ class CameraDevice:
             logger.error(f"Exposure failed: {e}")
             self._camera_state = CameraState.ERROR
             self._image_ready = False
+            # Keep the invariant "event set <=> nothing in flight". A failed
+            # exposure left it clear, so anything waiting on it blocked for the
+            # full timeout rather than failing fast.
+            self._exposure_complete.set()
 
     def _grab_frame(self) -> None:
         """Read the full frame into a native (H, W) uint16 buffer.
@@ -792,8 +825,14 @@ class CameraDevice:
         self._image_ready = True
 
     def abort_exposure(self) -> None:
+        # ERROR is in this tuple deliberately. ASCOM clients treat AbortExposure
+        # as the call that returns a camera to idle, so refusing it in the one
+        # state a client actually needs to escape from made the error permanent.
+        # Cancelling on ERROR is safe: the state is only ever set as the worker
+        # thread exits, so no exposure is in flight, and a FLICancelExposure that
+        # fails on a broken link is caught and warned about below.
         if self._camera_state in (CameraState.EXPOSING, CameraState.READING,
-                                  CameraState.WAITING):
+                                  CameraState.WAITING, CameraState.ERROR):
             if not self._demo and self._lib and self._dev != libfli.FLI_INVALID_DEVICE:
                 try:
                     fli_call(self._lib.FLICancelExposure, c_long(self._dev),
